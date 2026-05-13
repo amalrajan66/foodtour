@@ -1,19 +1,19 @@
 import os
 import uuid
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
-import json
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-# ── Config ────────────────────────────────────────────────────────────────────
 APP_TITLE = "Rome Food Tours API"
 TOURS_FILE = Path("./saved_tours.json")
-SESSIONS: dict = {}  # in-memory chat sessions
+SESSIONS: dict = {}
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -22,12 +22,11 @@ app = FastAPI(title=APP_TITLE)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to your Netlify/GH Pages URL in prod
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def load_tours() -> list:
     if TOURS_FILE.exists():
         return json.loads(TOURS_FILE.read_text())
@@ -36,15 +35,37 @@ def load_tours() -> list:
 def save_tours(tours: list) -> None:
     TOURS_FILE.write_text(json.dumps(tours, ensure_ascii=False, indent=2))
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
+def build_google_maps_preview(stops: list):
+    valid_stops = [s for s in stops if s.get("address")]
+    if len(valid_stops) < 2:
+        return None
+
+    origin = valid_stops[0]["address"]
+    destination = valid_stops[-1]["address"]
+    waypoints = [s["address"] for s in valid_stops[1:-1]]
+
+    directions_url = (
+        "https://www.google.com/maps/dir/?api=1"
+        f"&origin={quote(origin)}"
+        f"&destination={quote(destination)}"
+        f"&travelmode=walking"
+    )
+
+    if waypoints:
+        directions_url += f"&waypoints={quote('|'.join(waypoints))}"
+
+    return {
+        "directions_url": directions_url
+    }
+
 class TourPreferences(BaseModel):
     area: str = "Trastevere"
     duration_minutes: int = 180
-    budget: str = "medium"          # low | medium | high
+    budget: str = "medium"
     dietary: List[str] = []
     group_type: str = "solo"
     vibe: List[str] = []
-    walking_level: str = "moderate" # easy | moderate | high
+    walking_level: str = "moderate"
     time_of_day: str = "sera"
     language: str = "en"
     constraints_note: str = ""
@@ -62,44 +83,44 @@ class ChatRequest(BaseModel):
     user_message: str
     context: dict = {}
 
-# ── Prompts ───────────────────────────────────────────────────────────────────
 PLANNER_SYSTEM = """You are an expert local food tour guide for Rome, Italy.
 Generate a structured JSON food tour itinerary based on the user's preferences.
 Respond ONLY with valid JSON matching this exact schema:
 {
-  "tour_id": "<uuid string>",
-  "title": "<evocative short title>",
+  "tour_id": "",
+  "title": "",
   "description": "<2-3 sentence description>",
   "summary": {
-    "title": "<same as above>",
-    "description": "<same as above>",
-    "duration_minutes": <integer>,
-    "distance_km": <float>,
-    "budget": "<low|medium|high>"
+    "title": "",
+    "description": "",
+    "duration_minutes": 0,
+    "distance_km": 0,
+    "budget": ""
   },
   "stops": [
     {
       "order": 1,
-      "name": "<place name>",
-      "type": "<bar|trattoria|gelateria|mercato|pasticceria|etc>",
-      "address": "<street address, Rome>",
-      "description": "<what to eat and why this spot>",
-      "tip": "<insider tip>",
-      "duration_minutes": <integer>
+      "name": "",
+      "type": "",
+      "address": "",
+      "description": "",
+      "tip": "",
+      "duration_minutes": 0
     }
   ],
   "assistant_context": {
-    "session_id": "<uuid string>"
+    "session_id": ""
   }
 }
-Include 4-6 stops. Be specific with real Roman places."""
+Include 4-6 stops. Be specific with real Roman places.
+"""
 
 GUIDE_SYSTEM = """You are a friendly, knowledgeable live food tour guide for Rome.
 You are mid-tour with the user. Answer questions about food, culture, history,
 directions, or alternatives. Be concise (2-4 sentences), warm, and helpful.
-If you have tour context, reference it. Respond in the user's language."""
+If you have tour context, reference it. Respond in the user's language.
+"""
 
-# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"status": "ok", "app": APP_TITLE}
@@ -139,13 +160,13 @@ def plan_tour(req: PlanTourRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Ensure stable IDs
     if not tour_data.get("tour_id"):
         tour_data["tour_id"] = str(uuid.uuid4())
+
     session_id = str(uuid.uuid4())
     tour_data.setdefault("assistant_context", {})["session_id"] = session_id
+    tour_data["map_preview"] = build_google_maps_preview(tour_data.get("stops", []))
 
-    # Persist
     tours = load_tours()
     tours.append({
         "tour_id": tour_data["tour_id"],
@@ -157,7 +178,6 @@ def plan_tour(req: PlanTourRequest):
     })
     save_tours(tours)
 
-    # Seed chat session with tour context
     SESSIONS[session_id] = {
         "tour_id": tour_data["tour_id"],
         "history": [],
@@ -166,18 +186,20 @@ def plan_tour(req: PlanTourRequest):
 
     return tour_data
 
-
 @app.post("/api/chat")
 def chat(req: ChatRequest):
     session_id = req.session_id or str(uuid.uuid4())
-    session = SESSIONS.setdefault(session_id, {"tour_id": req.tour_id, "history": [], "tour_summary": ""})
+    session = SESSIONS.setdefault(
+        session_id,
+        {"tour_id": req.tour_id, "history": [], "tour_summary": ""}
+    )
 
     system_msg = GUIDE_SYSTEM
     if session.get("tour_summary"):
         system_msg += f"\n\nCurrent tour context:\n{session['tour_summary']}"
 
     messages = [{"role": "system", "content": system_msg}]
-    messages += session["history"][-10:]  # keep last 10 turns
+    messages += session["history"][-10:]
     messages.append({"role": "user", "content": req.user_message})
 
     try:
@@ -195,10 +217,8 @@ def chat(req: ChatRequest):
 
     return {"assistant_message": reply, "session_id": session_id}
 
-
 @app.get("/api/tours")
 def get_tours(user_id: str):
     tours = load_tours()
     user_tours = [t for t in tours if t.get("user_id") == user_id]
-    # Return newest first, last 20
     return list(reversed(user_tours[-20:]))
