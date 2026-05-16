@@ -15,8 +15,11 @@ APP_TITLE = "Rome Food Tours API"
 TOURS_FILE = Path("./saved_tours.json")
 SESSIONS: dict = {}
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI(title=APP_TITLE)
 
@@ -36,13 +39,32 @@ def save_tours(tours: list) -> None:
     TOURS_FILE.write_text(json.dumps(tours, ensure_ascii=False, indent=2))
 
 def build_google_maps_preview(stops: list):
-    valid_stops = [s for s in stops if s.get("address")]
-    if len(valid_stops) < 2:
+    if not GOOGLE_MAPS_API_KEY:
         return None
 
-    origin = valid_stops[0]["address"]
-    destination = valid_stops[-1]["address"]
-    waypoints = [s["address"] for s in valid_stops[1:-1]]
+    addresses = []
+    for stop in stops:
+        address = stop.get("address") or stop.get("name")
+        if address:
+            addresses.append(address)
+
+    if len(addresses) < 2:
+        return None
+
+    origin = addresses[0]
+    destination = addresses[-1]
+    waypoints = addresses[1:-1]
+
+    embed_url = (
+        "https://www.google.com/maps/embed/v1/directions"
+        f"?key={quote(GOOGLE_MAPS_API_KEY)}"
+        f"&origin={quote(origin)}"
+        f"&destination={quote(destination)}"
+        f"&mode=walking"
+    )
+
+    if waypoints:
+        embed_url += f"&waypoints={quote('|'.join(waypoints))}"
 
     directions_url = (
         "https://www.google.com/maps/dir/?api=1"
@@ -55,6 +77,7 @@ def build_google_maps_preview(stops: list):
         directions_url += f"&waypoints={quote('|'.join(waypoints))}"
 
     return {
+        "embed_url": embed_url,
         "directions_url": directions_url
     }
 
@@ -124,6 +147,13 @@ If you have tour context, reference it. Respond in the user's language.
 @app.get("/")
 def root():
     return {"status": "ok", "app": APP_TITLE}
+
+@app.get("/api/maps/health")
+def maps_health():
+    return {
+        "ok": True,
+        "has_google_maps_key": bool(GOOGLE_MAPS_API_KEY)
+    }
 
 @app.post("/api/plan-tour")
 def plan_tour(req: PlanTourRequest):
